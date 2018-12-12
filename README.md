@@ -77,7 +77,7 @@ func (m *Broadcaster) loop() {
 	// bug in watch.Broadcaster.
 	for event := range m.incoming {
 		if event.Type == internalRunFunctionMarker {
-			event.Object.(functionFakeRuntimeObject)()
+			event.Object.(functionFakeRuntimeObject)() // 这句话是重点，因为这个特殊的event.Type是被用来添加watcher的,
 			continue
 		}
 		m.distribute(event)
@@ -133,7 +133,7 @@ func (b *Broadcaster) blockQueue(f func()) {
 		Type: internalRunFunctionMarker,
 		Object: functionFakeRuntimeObject(func() {
 			defer wg.Done()
-			f()
+			f()  // 这个f的计算发生在对方拿到event之后，执行这个方法
 		}),
 	}
 	wg.Wait()
@@ -144,11 +144,12 @@ func (b *Broadcaster) blockQueue(f func()) {
 // of previous events.
 
 //  增加一个watcher，并且返回他的interface
-//  该watcher只能收到他加入后之后来的消息，而无法收到历史消息
+//  该watcher只能收到他加入后之后 来的消息，而无法收到历史消息
 func (m *Broadcaster) Watch() Interface {
 	var w *broadcasterWatcher
 	m.blockQueue(func() {
-		m.lock.Lock()
+		// 此处的lock也是为了保证map的并发安全（此处插一句话，golang除了chan，我暂时发现，哪个类型是并发安全的）
+		m.lock.Lock() 
 		defer m.lock.Unlock()
 		id := m.nextWatcher
 		m.nextWatcher++
@@ -161,5 +162,100 @@ func (m *Broadcaster) Watch() Interface {
 		m.watchers[id] = w
 	})
 	return w
+}
+
+
+// WatchWithPrefix adds a new watcher to the list and returns an Interface for it. It sends
+// queuedEvents down the new watch before beginning to send ordinary events from Broadcaster.
+// The returned watch will have a queue length that is at least large enough to accommodate
+// all of the items in queuedEvents.
+
+// 增加一个watcher，并且将传入的events， 首先发入该队列，并且在必要的时候加大该队列的buffer
+func (m *Broadcaster) WatchWithPrefix(queuedEvents []Event) Interface {
+	var w *broadcasterWatcher
+	m.blockQueue(func() {
+		m.lock.Lock()
+		defer m.lock.Unlock()
+		id := m.nextWatcher
+		m.nextWatcher++
+		length := m.watchQueueLength
+		if n := len(queuedEvents) + 1; n > length {
+			length = n
+		}
+		w = &broadcasterWatcher{
+			result:  make(chan Event, length),
+			stopped: make(chan struct{}),
+			id:      id,
+			m:       m,
+		}
+		m.watchers[id] = w
+		for _, e := range queuedEvents {
+			w.result <- e
+		}
+	})
+	return w
+}
+```
+
+
+
+```go
+
+// stopWatching stops the given watcher and removes it from the list.
+// 将一个给定id的watcher从wachter map中移除
+func (m *Broadcaster) stopWatching(id int64) {
+	// 加上锁来保护map
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	w, ok := m.watchers[id]
+	if !ok {
+		// No need to do anything, it's already been removed from the list.
+		return
+	}
+	delete(m.watchers, id)
+	close(w.result)
+}
+
+// closeAll disconnects all watchers (presumably in response to a Shutdown call).
+// 断开所有的watcher, 一般在关闭的时候才用
+func (m *Broadcaster) closeAll() {
+	// 加上锁来保护map
+	m.lock.Lock()
+	defer m.lock.Unlock()
+	for _, w := range m.watchers {
+		close(w.result)
+	}
+	// Delete everything from the map, since presence/absence in the map is used
+	// by stopWatching to avoid double-closing the channel.
+	
+	// TODO  上面说了个什么鬼。。完全没听懂
+	m.watchers = map[int64]*broadcasterWatcher{}
+}
+
+```
+
+
+```go
+// Action distributes the given event among all watchers.
+// 发送消息
+func (m *Broadcaster) Action(action EventType, obj runtime.Object) {
+	m.incoming <- Event{action, obj}
+}
+```
+
+```go
+
+// Shutdown disconnects all watchers (but any queued events will still be distributed).
+// You must not call Action or Watch* after calling Shutdown. This call blocks
+// until all events have been distributed through the outbound channels. Note
+// that since they can be buffered, this means that the watchers might not
+// have received the data yet as it can remain sitting in the buffered
+// channel.
+
+// 关闭所有的watcher，但是在排队的事件仍然会被分发，关闭之后，不能再调用Action,或者Watch*，这个调用会阻塞到所有的事件被分发完毕，
+// 注意，为因为他们可以被buffer,所以这意味着这watcher，可能不会收到数据，因为他们可能被扔在buffer的chan中
+func (m *Broadcaster) Shutdown() {
+	close(m.incoming)
+	m.distributing.Wait()
 }
 ```
