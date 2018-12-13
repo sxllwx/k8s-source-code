@@ -145,6 +145,7 @@ func (b *Broadcaster) blockQueue(f func()) {
 
 //  增加一个watcher，并且返回他的interface
 //  该watcher只能收到他加入后之后 来的消息，而无法收到历史消息
+//  为何不直接lock,unlock保护下，完成添加watcher,就是为了将watcher加入的时间和Event到来的时间点进行确认。
 func (m *Broadcaster) Watch() Interface {
 	var w *broadcasterWatcher
 	m.blockQueue(func() {
